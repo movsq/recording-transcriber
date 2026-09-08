@@ -82,17 +82,17 @@ class Work:
         return found[0] if found else None
 
     def read_meta(self) -> dict:
-        return json.load(open(self.meta)) if self.meta.exists() else {}
+        return json.load(open(self.meta, encoding="utf-8")) if self.meta.exists() else {}
 
     def update_meta(self, **kv) -> None:
         m = self.read_meta(); m.update(kv)
-        json.dump(m, open(self.meta, "w"), ensure_ascii=False, indent=2)
+        json.dump(m, open(self.meta, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
     def result(self) -> dict:
         """Best available transcript (diarized if present)."""
         for p in (self.diarized, self.transcript):
             if p.exists():
-                return json.load(open(p))
+                return json.load(open(p, encoding="utf-8"))
         die(f"no transcript in {self.dir} – run `transcribe` first")
 
 
@@ -572,7 +572,7 @@ def stage_transcribe(w: Work, model_name: str, language: str | None, device: str
                      beam_size: int = 5) -> dict:
     if w.transcript.exists() and not force:
         log(f"transcribe: {w.transcript.name} exists, skipping (use --force to redo)")
-        return json.load(open(w.transcript))
+        return json.load(open(w.transcript, encoding="utf-8"))
     if not w.wav.exists():
         die("transcribe: audio.wav missing – run `audio` first")
     device, vendor, name = resolve_device(device)
@@ -592,7 +592,7 @@ def stage_transcribe(w: Work, model_name: str, language: str | None, device: str
     align_model, meta = whisperx.load_align_model(language_code=lang, device=device)
     result = whisperx.align(result["segments"], align_model, meta, audio, device, return_char_alignments=False)
     result["language"] = lang
-    json.dump(result, open(w.transcript, "w"), ensure_ascii=False)
+    json.dump(result, open(w.transcript, "w", encoding="utf-8"), ensure_ascii=False)
     w.update_meta(model=model_name, language=lang, backend=backend, device=f"{vendor}:{device}")
     if w.diarized.exists():
         w.diarized.unlink()
@@ -607,7 +607,7 @@ def stage_transcribe(w: Work, model_name: str, language: str | None, device: str
 def stage_diarize(w: Work, device: str, force: bool = False) -> dict:
     if w.diarized.exists() and not force:
         log(f"diarize: {w.diarized.name} exists, skipping (use --force to redo)")
-        return json.load(open(w.diarized))
+        return json.load(open(w.diarized, encoding="utf-8"))
     if not w.transcript.exists():
         die("diarize: transcript.json missing – run `transcribe` first")
     if not w.wav.exists():
@@ -621,10 +621,10 @@ def stage_diarize(w: Work, device: str, force: bool = False) -> dict:
     # runs wherever torch runs, AMD included.
     log(f"diarize: running pyannote on {name} (a few minutes)")
     audio = whisperx.load_audio(str(w.wav))
-    result = json.load(open(w.transcript))
+    result = json.load(open(w.transcript, encoding="utf-8"))
     segs = DiarizationPipeline(device=device)(audio)
     result = assign_word_speakers(segs, result)
-    json.dump(result, open(w.diarized, "w"), ensure_ascii=False)
+    json.dump(result, open(w.diarized, "w", encoding="utf-8"), ensure_ascii=False)
     n = len({s.get("speaker") for s in result["segments"]})
     log(f"diarize: {n} speakers -> {w.diarized.name}. Next: `speakers show`")
     return result
@@ -653,7 +653,7 @@ def speaker_stats(result: dict, samples: int = 3) -> list[dict]:
 
 
 def load_speakers_cfg(w: Work) -> dict:
-    return json.load(open(w.speakers)) if w.speakers.exists() else {"default": None, "speakers": {}}
+    return json.load(open(w.speakers, encoding="utf-8")) if w.speakers.exists() else {"default": None, "speakers": {}}
 
 
 def cmd_speakers_show(w: Work, top: int, as_json: bool, samples: int) -> None:
@@ -700,7 +700,7 @@ def cmd_speakers_set(w: Work, pairs: list[str], default: str | None, clear: bool
         cfg["speakers"][k] = v
     if default is not None:
         cfg["default"] = default
-    json.dump(cfg, open(w.speakers, "w"), ensure_ascii=False, indent=2)
+    json.dump(cfg, open(w.speakers, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     log(f"speakers: saved {w.speakers} ({len(cfg['speakers'])} named, default={cfg['default']!r})")
 
 
@@ -732,7 +732,8 @@ def cmd_speakers_ask(w: Work, top: int, default_label: str) -> None:
     default = default_label
     if rest > 0:
         default = input(f"\nlabel for the remaining {rest} speakers [{default_label}]: ").strip() or default_label
-    json.dump({"default": default, "speakers": mapping}, open(w.speakers, "w"), ensure_ascii=False, indent=2)
+    json.dump({"default": default, "speakers": mapping}, open(w.speakers, "w", encoding="utf-8"),
+              ensure_ascii=False, indent=2)
     log(f"speakers: saved {w.speakers}")
 
 
@@ -740,7 +741,7 @@ def cmd_speakers_ask(w: Work, top: int, default_label: str) -> None:
 
 def write_tsv(segments, path: Path, label) -> None:
     """One segment per row: start/end in ms (same as WhisperX's .tsv), speaker label (empty if none), text."""
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write("start\tend\tspeaker\ttext\n")
         for seg in segments:
             text = " ".join(seg["text"].split())
@@ -764,7 +765,7 @@ def stage_write(w: Work, only: str | None = None, out_stem: str | None = None) -
     txt, srt, tsv = w.dir / f"{stem}.txt", w.dir / f"{stem}.srt", w.dir / f"{stem}.tsv"
     kept = skipped = words = 0
     rows = []
-    with open(txt, "w") as f, open(srt, "w") as g:
+    with open(txt, "w", encoding="utf-8") as f, open(srt, "w", encoding="utf-8") as g:
         last = object(); gap = None; n = 0
         for seg in result["segments"]:
             text = seg["text"].strip(); lb = label(seg)
