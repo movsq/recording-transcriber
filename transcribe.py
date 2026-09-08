@@ -633,6 +633,12 @@ def stage_diarize(w: Work, device: str, force: bool = False) -> dict:
 
 # ----------------------------------------------------------------------------- speakers
 
+# Speaker labels end up in file names via `write --only PREFIX`, so keep out
+# whitespace and path punctuation - but \w is Unicode-aware, so Czech names like
+# Mazgal or Zizka with diacritics are fine.
+LABEL_RE = r"[\w.-]+"
+
+
 def speaker_stats(result: dict, samples: int = 3) -> list[dict]:
     stats: dict[str, dict] = {}
     for seg in result["segments"]:
@@ -696,8 +702,8 @@ def cmd_speakers_set(w: Work, pairs: list[str], default: str | None, clear: bool
         k, v = p.split("=", 1)
         if k not in known:
             die(f"{k} is not a speaker in this transcript (see `speakers show`)")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", v):
-            die(f"label {v!r}: use letters, digits, _ . - only")
+        if not re.fullmatch(LABEL_RE, v):
+            die(f"label {v!r}: use letters, digits, _ . - only (no spaces)")
         cfg["speakers"][k] = v
     if default is not None:
         cfg["default"] = default
@@ -723,8 +729,8 @@ def cmd_speakers_ask(w: Work, top: int, default_label: str) -> None:
             ans = input(f"   label for {s['id']} [{default_label}]: ").strip()
             if ans == "=" and prev:
                 ans = prev
-            if ans and not re.fullmatch(r"[A-Za-z0-9_.-]+", ans):
-                print("   use letters, digits, _ . - only")
+            if ans and not re.fullmatch(LABEL_RE, ans):
+                print("   use letters, digits, _ . - only (no spaces)")
                 continue
             break
         if ans:
@@ -768,6 +774,7 @@ def stage_write(w: Work, only: str | None = None, out_stem: str | None = None) -
     rows = []
     with open(txt, "w", encoding="utf-8") as f, open(srt, "w", encoding="utf-8") as g:
         last = object(); gap = None; n = 0
+        started = False  # no blank lines before the first block
         for seg in result["segments"]:
             text = seg["text"].strip(); lb = label(seg)
             if only and not (lb or "").startswith(only):
@@ -776,14 +783,16 @@ def stage_write(w: Work, only: str | None = None, out_stem: str | None = None) -
                 continue
             kept += 1; words += len(text.split()); rows.append(seg)
             if gap is not None:
-                f.write(f"\n\n[… {fmt_ts(gap, '.')[:-4]}–{fmt_ts(seg['start'], '.')[:-4]} omitted]")
-                gap = None; last = object()
+                f.write(("\n\n" if started else "")
+                        + f"[… {fmt_ts(gap, '.')[:-4]}–{fmt_ts(seg['start'], '.')[:-4]} omitted]")
+                gap = None; last = object(); started = True
             if lb is None:
                 f.write(text + "\n")
             else:
                 if lb != last:
-                    f.write(f"\n\n[{lb}] "); last = lb
+                    f.write(("\n\n" if started else "") + f"[{lb}] "); last = lb
                 f.write(text + " ")
+            started = True
             n += 1
             pre = f"[{lb}] " if lb else ""
             g.write(f"{n}\n{fmt_ts(seg['start'])} --> {fmt_ts(seg['end'])}\n{pre}{text}\n\n")
