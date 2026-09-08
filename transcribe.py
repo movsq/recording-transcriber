@@ -474,7 +474,7 @@ def detect_language_torch(model, processor, feats) -> str:
         with torch.no_grad():
             ids = model.detect_language(feats)
         text = processor.tokenizer.decode(ids[0], skip_special_tokens=False)
-    except Exception:
+    except (AttributeError, TypeError):  # older transformers without detect_language; let OOM etc. surface
         with torch.no_grad():
             out = model.generate(feats, max_new_tokens=1)
         text = processor.tokenizer.decode(out[0], skip_special_tokens=False)
@@ -807,6 +807,8 @@ def stage_write(w: Work, only: str | None = None, out_stem: str | None = None) -
             n += 1
             pre = f"[{lb}] " if lb else ""
             g.write(f"{n}\n{fmt_ts(seg['start'])} --> {fmt_ts(seg['end'])}\n{pre}{text}\n\n")
+        if kept and has_speakers:
+            f.write("\n")  # speaker blocks end with a space, so close the file with a newline
     extra = f", kept {kept} / skipped {skipped} segments" if only else ""
     log(f"write: {txt} ({words} words{extra})")
     write_tsv(rows, tsv, label)
@@ -905,7 +907,9 @@ def main(argv=None) -> None:
                        help="auto-detects NVIDIA/AMD/Apple/Intel GPUs; rocm forces an AMD card")
 
     def add_asr(p):
-        p.add_argument("-m", "--model", default="large-v3")
+        p.add_argument("-m", "--model", default="large-v3",
+                       help="Whisper size (tiny … large-v3, turbo) or a HuggingFace repo id; a repo id must match "
+                            "the backend (CTranslate2 weights for faster-whisper, transformers weights for torch)")
         p.add_argument("-l", "--language", default=None, help="e.g. cs, en; default auto-detect")
         p.add_argument("-b", "--batch-size", type=int, default=4)
         p.add_argument("--backend", default="auto", choices=BACKEND_CHOICES,

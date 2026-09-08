@@ -178,12 +178,6 @@ computer at any point. Skip all of it with `--no-diarize`.
 The script verifies the token and both licences *before* spending 20 minutes on
 transcription.
 
-### 4. Check it
-
-```bash
-uv run transcribe.py devices
-```
-
 ---
 
 ## Usage
