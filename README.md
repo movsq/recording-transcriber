@@ -206,6 +206,13 @@ AMD lists the full set of packages at
 - **Already built [`ctranslate2-rocm`](https://github.com/arlo-phoenix/CTranslate2-rocm)?**
   Then `--backend faster-whisper --device rocm` uses it instead.
 
+Three warnings show up on a normal run and none of them mean anything is wrong:
+`torchcodec is not installed correctly` (pyannote pulls torchcodec in for file
+decoding and pip does not always match it to the ROCm torch build – this script
+hands pyannote audio that is already in memory, so that decoder is never used),
+`Using AOTriton backend for Efficient Attention` (that is ROCm’s attention kernel
+doing its job) and Lightning offering to upgrade the bundled VAD checkpoint.
+
 ## SharePoint links
 
 Anonymous "anyone with the link" share links (`/:v:/g/personal/...`) are

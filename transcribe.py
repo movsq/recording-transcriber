@@ -153,7 +153,8 @@ def stage_audio(w: Work, src: Path | None) -> Path:
     if src is None or not src.exists():
         die("audio: no media file – pass a path or run `download` first")
     if not shutil.which("ffmpeg"):
-        die("ffmpeg not found – install it (pacman -S ffmpeg / apt install ffmpeg / brew install ffmpeg)")
+        die("ffmpeg not found – install it (pacman -S ffmpeg / apt install ffmpeg / "
+            "brew install ffmpeg / winget install Gyan.FFmpeg)")
     log(f"audio: extracting mono 16 kHz wav from {src.name}")
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
                     "-c:a", "pcm_s16le", str(w.wav)], check=True)
