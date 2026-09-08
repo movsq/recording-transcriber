@@ -429,6 +429,11 @@ SAMPLE_RATE = 16000
 # audio into the same speech chunks and produce comparable segments.
 VAD_CHUNK_S, VAD_ONSET, VAD_OFFSET = 30, 0.500, 0.363
 
+# pyannote runs the VAD 32 windows at a time, which barely occupies a GPU: on an
+# RX 9070 XT that made the VAD the slowest stage of the whole run, above Whisper
+# itself. 128 is ~5x faster for byte-identical chunks and peaks under 1 GiB.
+VAD_BATCH = 128
+
 # faster-whisper model names -> the equivalent transformers repo, for the ones
 # where it is not just openai/whisper-<name>.
 HF_WHISPER_REPOS = {
@@ -455,6 +460,9 @@ def vad_chunks(audio, device: str) -> list[dict]:
     from whisperx.vads import Pyannote
     vad = Pyannote(torch.device(device), token=None,
                    vad_onset=VAD_ONSET, vad_offset=VAD_OFFSET, chunk_size=VAD_CHUNK_S)
+    segmentation = getattr(vad.vad_pipeline, "_segmentation", None)
+    if device != "cpu" and segmentation is not None:
+        segmentation.batch_size = VAD_BATCH
     raw = vad({"waveform": Pyannote.preprocess_audio(audio), "sample_rate": SAMPLE_RATE})
     return Pyannote.merge_chunks(raw, VAD_CHUNK_S, onset=VAD_ONSET, offset=VAD_OFFSET)
 
@@ -489,6 +497,17 @@ def transcribe_torch(audio, model_name: str, language: str | None, device: str, 
     dtype = getattr(torch, compute, None)
     if not isinstance(dtype, torch.dtype):
         die(f"--compute-type {compute} is not a torch dtype; use float16, bfloat16 or float32")
+    english_only = repo.endswith(".en")
+    if english_only:
+        language = "en"
+
+    # VAD first, then let it go: the two models never need to be resident together.
+    log("transcribe: voice activity detection")
+    chunks = vad_chunks(audio, device)
+    if not chunks:
+        die("transcribe: no speech found in the audio")
+    empty_cache(device)
+
     log(f"transcribe: loading {repo} ({compute}) on {device} via transformers")
     processor = AutoProcessor.from_pretrained(repo)
     try:
@@ -496,15 +515,6 @@ def transcribe_torch(audio, model_name: str, language: str | None, device: str, 
     except TypeError:  # transformers < 4.56 spells it torch_dtype
         model = WhisperForConditionalGeneration.from_pretrained(repo, torch_dtype=dtype)
     model = model.to(device).eval()
-
-    english_only = repo.endswith(".en")
-    if english_only:
-        language = "en"
-
-    log("transcribe: voice activity detection")
-    chunks = vad_chunks(audio, device)
-    if not chunks:
-        die("transcribe: no speech found in the audio")
 
     def features(batch):
         f = processor([audio[int(c["start"] * SAMPLE_RATE):int(c["end"] * SAMPLE_RATE)] for c in batch],

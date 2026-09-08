@@ -145,10 +145,18 @@ python transcribe.py devices                      # check what was detected
 python transcribe.py run meeting.mp4 -l cs
 ```
 
-Measured on an RX 9070 XT (gfx1201, ROCm 7.13, Windows, `torch` backend): `large-v3`
-turns ten minutes of audio into an aligned transcript in about 50 s. `-b 4` and
-`-b 8` came out the same, `-b 16` was slower, so the default `-b 4` is a fine
-starting point.
+Measured on an RX 9070 XT (gfx1201, ROCm 7.13, Windows, `torch` backend):
+`large-v3` turns ten minutes of audio into an aligned transcript in about 40 s.
+
+Two knobs are tempting and both are traps on this backend:
+
+- **`-b` above 4 does not help.** Beam search already multiplies the batch by the
+  beam width, so `-b 8` was twice as slow as `-b 4` and `-b 16` peaked at 23 GiB
+  and took five times as long. The default is the sweet spot.
+- **`--beam-size 1` is about 3x faster and loses text.** On clean audio it is
+  indistinguishable, which makes it look free; on a real Czech monologue it
+  dropped 11 % of the words and two whole clauses. The default of 5 is what
+  WhisperX already used – lower it only after checking the result yourself.
 
 ### Install
 
