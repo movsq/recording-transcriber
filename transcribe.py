@@ -214,7 +214,7 @@ def cuda_api_gpu(torch) -> tuple[str, str] | None:
     return vendor, torch.cuda.get_device_name(0)
 
 
-def resolve_device(requested: str) -> tuple[str, str, str]:
+def resolve_device(requested: str, quiet: bool = False) -> tuple[str, str, str]:
     """--device -> (torch device, vendor, device name), or exit with a fixable message."""
     torch = import_torch()
     hip = getattr(torch.version, "hip", None)
@@ -232,7 +232,8 @@ def resolve_device(requested: str) -> tuple[str, str, str]:
             return "mps", "apple", "Apple Silicon GPU"
         if has_xpu:
             return "xpu", "intel", torch.xpu.get_device_name(0)
-        log("device: no GPU found, falling back to cpu (slow – try -m medium)")
+        if not quiet:  # `devices --json` must keep stdout pure JSON
+            log("device: no GPU found, falling back to cpu (slow – try -m medium)")
         return "cpu", "cpu", "CPU"
 
     if requested in ("cuda", "rocm"):
@@ -369,7 +370,7 @@ def cmd_devices(as_json: bool) -> None:
     """What torch can see here, and what --device auto would pick."""
     torch = import_torch()
     gpu = cuda_api_gpu(torch)
-    device, vendor, name = resolve_device("auto")
+    device, vendor, name = resolve_device("auto", quiet=True)
     backend = resolve_backend("auto", vendor)
     try:
         import ctranslate2
@@ -495,8 +496,8 @@ def transcribe_torch(audio, model_name: str, language: str | None, device: str, 
 
     repo = hf_whisper_repo(model_name)
     dtype = getattr(torch, compute, None)
-    if not isinstance(dtype, torch.dtype):
-        die(f"--compute-type {compute} is not a torch dtype; use float16, bfloat16 or float32")
+    if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:  # torch.int8 exists but cannot load weights
+        die(f"--compute-type {compute} does not work with the torch backend; use float16, bfloat16 or float32")
     english_only = repo.endswith(".en")
     if english_only:
         language = "en"
