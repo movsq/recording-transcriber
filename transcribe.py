@@ -10,10 +10,12 @@ One-shot (interactive speaker naming at the end):
     uv run transcribe.py run <video|audio|url> -l cs
 
 Step by step (each command is idempotent and prints what it did; good for scripts and AI agents):
+    uv run transcribe.py devices                             which GPU and ASR backend will be used
     uv run transcribe.py status      -w work/x               what exists, what is next
     uv run transcribe.py download    <url>        -w work/x  SharePoint share link or direct URL
     uv run transcribe.py audio       <media>      -w work/x  ffmpeg -> mono 16 kHz wav
     uv run transcribe.py transcribe  -w work/x -l cs         WhisperX + word alignment
+                                     [--device auto|cuda|rocm|mps|xpu|cpu] [--backend auto|faster-whisper|torch]
     uv run transcribe.py diarize     -w work/x               pyannote speaker labels (needs HF token)
     uv run transcribe.py speakers show -w work/x [--json]    who talked how much, with sample lines
     uv run transcribe.py speakers set  -w work/x SPEAKER_03=teacher SPEAKER_07=teacher --default student
@@ -27,11 +29,14 @@ Add --json to status / speakers show for machine-readable output.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -159,19 +164,242 @@ def stage_audio(w: Work, src: Path | None) -> Path:
     return w.wav
 
 
+# ----------------------------------------------------------------------------- device / backend
+
+# WhisperX transcribes through CTranslate2, which ships CUDA and CPU kernels only.
+# The rest of the pipeline – the pyannote VAD, wav2vec2 alignment, pyannote
+# diarization – is plain PyTorch and runs on any device torch supports, AMD ROCm
+# included. So on a non-CUDA GPU we keep all of that and swap out only the ASR
+# step for the transformers implementation of Whisper (`--backend torch`), which
+# is torch all the way down. transformers is already a WhisperX dependency.
+
+DEVICE_CHOICES = ["auto", "cuda", "rocm", "mps", "xpu", "cpu"]
+BACKEND_CHOICES = ["auto", "faster-whisper", "torch"]
+COMPUTE_CHOICES = ["auto", "float16", "bfloat16", "float32", "int8"]
+
+VENDOR_NAME = {"nvidia": "NVIDIA", "amd": "AMD", "apple": "Apple", "intel": "Intel", "cpu": "CPU"}
+
+ROCM_HINT = ("Install a ROCm build of PyTorch, e.g.\n"
+             "    pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ "
+             "'torch[device-gfx1201]' torchaudio\n"
+             "  with your GPU's arch instead of gfx1201 (gfx1100 = RX 7900, gfx1030 = RX 6800/6900;\n"
+             "  rocminfo prints it). See the AMD section of the README.")
+
+
+def device_label(vendor: str, name: str) -> str:
+    """'AMD Radeon RX 9070 XT', not 'AMD AMD Radeon RX 9070 XT'."""
+    v = VENDOR_NAME.get(vendor, vendor)
+    return name if name.upper().startswith(v.upper()) else f"{v} {name}"
+
+
+def import_torch():
+    try:
+        import torch
+    except ImportError:
+        die("PyTorch is not installed – run the script with `uv run transcribe.py` "
+            "or install torch into the venv you are using")
+    return torch
+
+
+def cuda_api_gpu(torch) -> tuple[str, str] | None:
+    """(vendor, name) of the GPU torch exposes through its cuda API, or None.
+
+    A ROCm build reports AMD cards through that same API: device strings stay
+    "cuda", torch.version.cuda is None and torch.version.hip holds the ROCm version.
+    """
+    if not torch.cuda.is_available():
+        return None
+    vendor = "amd" if getattr(torch.version, "hip", None) else "nvidia"
+    return vendor, torch.cuda.get_device_name(0)
+
+
+def resolve_device(requested: str) -> tuple[str, str, str]:
+    """--device -> (torch device, vendor, device name), or exit with a fixable message."""
+    torch = import_torch()
+    hip = getattr(torch.version, "hip", None)
+    gpu = cuda_api_gpu(torch)
+    has_mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    has_xpu = bool(getattr(torch, "xpu", None) and torch.xpu.is_available())
+
+    if requested == "cpu":
+        return "cpu", "cpu", "CPU"
+
+    if requested == "auto":
+        if gpu:
+            return "cuda", gpu[0], gpu[1]
+        if has_mps:
+            return "mps", "apple", "Apple Silicon GPU"
+        if has_xpu:
+            return "xpu", "intel", torch.xpu.get_device_name(0)
+        log("device: no GPU found, falling back to cpu (slow – try -m medium)")
+        return "cpu", "cpu", "CPU"
+
+    if requested in ("cuda", "rocm"):
+        if gpu is None:
+            if requested == "rocm" and not hip:
+                build = (f"a CUDA {torch.version.cuda} build" if getattr(torch.version, "cuda", None)
+                         else "CPU-only")
+                die(f"--device rocm, but PyTorch {torch.__version__} is {build}.\n  {ROCM_HINT}")
+            if hip:
+                die(f"PyTorch {torch.__version__} has ROCm {hip} but sees no GPU.\n"
+                    "  Check rocm-smi, that your user is in the render and video groups (Linux),\n"
+                    "  and if the card is not officially supported try HSA_OVERRIDE_GFX_VERSION\n"
+                    "  (11.0.0 for RDNA3, 10.3.0 for RDNA2).")
+            die("no GPU available – use --device cpu (slow) or fix the GPU setup")
+        vendor, name = gpu
+        if requested == "rocm" and vendor != "amd":
+            die(f"--device rocm, but this PyTorch is a CUDA build driving {name} – use --device cuda")
+        return "cuda", vendor, name
+
+    if requested == "mps":
+        if not has_mps:
+            die("Metal (mps) not available – needs Apple Silicon and a torch build with MPS")
+        return "mps", "apple", "Apple Silicon GPU"
+
+    if not has_xpu:
+        die("Intel XPU not available – needs a torch build with XPU support and the oneAPI runtime")
+    return "xpu", "intel", torch.xpu.get_device_name(0)
+
+
+def resolve_backend(requested: str, vendor: str) -> str:
+    """Which Whisper implementation to transcribe with."""
+    if requested != "auto":
+        return requested
+    # CTranslate2 has no ROCm/Metal/XPU backend, so everything but NVIDIA and CPU goes through torch.
+    return "faster-whisper" if vendor in ("nvidia", "cpu") else "torch"
+
+
+def resolve_compute_type(requested: str, backend: str, device: str) -> str:
+    if requested != "auto":
+        return requested
+    if device == "cpu":
+        return "int8" if backend == "faster-whisper" else "float32"
+    return "float16"
+
+
+def log_device(device: str, vendor: str, name: str, backend: str, compute: str) -> None:
+    torch = import_torch()
+    if getattr(torch.version, "hip", None):
+        runtime = f"ROCm {torch.version.hip}"
+    elif getattr(torch.version, "cuda", None):
+        runtime = f"CUDA {torch.version.cuda}"
+    else:
+        runtime = "cpu build"
+    mem = ""
+    try:
+        if device == "cuda":
+            free, total = torch.cuda.mem_get_info()
+        elif device == "xpu" and hasattr(torch.xpu, "mem_get_info"):
+            free, total = torch.xpu.mem_get_info()
+        else:
+            free = total = None
+        if free is not None:
+            mem = f", {free / 2**30:.1f} GiB free of {total / 2**30:.1f}"
+    except Exception:
+        pass
+    log(f"device: {device_label(vendor, name)} [torch {torch.__version__} / {runtime}]{mem}")
+    log(f"backend: {backend} ({compute})")
+    if backend == "faster-whisper" and vendor not in ("nvidia", "cpu"):
+        log("backend: CTranslate2 has no non-CUDA GPU backend – this needs a patched build "
+            "(e.g. ctranslate2-rocm). Drop --backend to use the torch one.")
+
+
+@contextlib.contextmanager
+def muffled_stderr():
+    """MIOpen prints kernel-compile failures straight to fd 2, around the exception.
+    The probe below expects those, so keep the wall of C++ errors off the terminal."""
+    try:
+        fd = sys.stderr.fileno()
+        saved = os.dup(fd)
+    except (AttributeError, OSError, ValueError):
+        yield  # stderr is not a real file (pytest, notebooks) - nothing to muffle
+        return
+    try:
+        with tempfile.TemporaryFile() as sink:
+            sys.stderr.flush()
+            os.dup2(sink.fileno(), fd)
+            yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved, fd)
+        os.close(saved)
+
+
+def check_norm_kernels(device: str) -> None:
+    """Make sure normalisation layers work, and route around MIOpen if they do not.
+
+    pyannote's SincNet (the VAD and the diarization segmenter) uses
+    InstanceNorm1d(affine=True), which torch hands to cuDNN/MIOpen. MIOpen compiles
+    that kernel at runtime, and some ROCm builds – the Windows ones as of ROCm 7.13 –
+    ship a HIPRTC include path that cannot compile it, so every call dies with
+    miopenStatusUnknownError. PyTorch's own kernel is fine and costs nothing
+    noticeable here, so probe once and switch the whole process over if needed.
+    """
+    torch = import_torch()
+    cudnn = getattr(torch.backends, "cudnn", None)
+    if device != "cuda" or cudnn is None or not cudnn.enabled:
+        return
+    try:
+        norm = torch.nn.InstanceNorm1d(1, affine=True).to(device)
+        with muffled_stderr(), torch.no_grad():
+            norm(torch.zeros(1, 1, 4096, device=device))
+            torch.cuda.synchronize()
+    except RuntimeError as e:
+        cudnn.enabled = False
+        first = str(e).strip().splitlines()[0]
+        log(f"device: cuDNN/MIOpen cannot run normalisation layers here ({first}) "
+            f"– using PyTorch's own kernels instead")
+
+
+def is_oom(exc: BaseException) -> bool:
+    """CUDA says 'CUDA out of memory', ROCm 'HIP out of memory', MPS and XPU differ again."""
+    return type(exc).__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower()
+
+
+def empty_cache(device: str) -> None:
+    torch = import_torch()
+    mod = {"cuda": torch.cuda, "mps": getattr(torch, "mps", None),
+           "xpu": getattr(torch, "xpu", None)}.get(device)
+    if mod is not None and hasattr(mod, "empty_cache"):
+        mod.empty_cache()
+
+
+def cmd_devices(as_json: bool) -> None:
+    """What torch can see here, and what --device auto would pick."""
+    torch = import_torch()
+    gpu = cuda_api_gpu(torch)
+    device, vendor, name = resolve_device("auto")
+    backend = resolve_backend("auto", vendor)
+    try:
+        import ctranslate2
+        ct2 = f"{ctranslate2.__version__}, {ctranslate2.get_cuda_device_count()} CUDA device(s)"
+    except Exception as e:
+        ct2 = f"unavailable ({type(e).__name__})"
+    info = {
+        "torch": torch.__version__,
+        "torch_build": ("ROCm " + torch.version.hip) if getattr(torch.version, "hip", None)
+                       else ("CUDA " + torch.version.cuda) if getattr(torch.version, "cuda", None)
+                       else "cpu",
+        "gpu": device_label(*gpu) if gpu else None,
+        "mps": bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()),
+        "xpu": bool(getattr(torch, "xpu", None) and torch.xpu.is_available()),
+        "ctranslate2": ct2,
+        "device": device,
+        "vendor": vendor,
+        "backend": backend,
+    }
+    if as_json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return
+    for k, v in info.items():
+        print(f"  {k}: {v}")
+    print(f"\n--device auto picks {device} ({device_label(vendor, name)}) "
+          f"with the {backend} backend.")
+
+
 # ----------------------------------------------------------------------------- preflight
 
 PYANNOTE_MODELS = ["pyannote/speaker-diarization-community-1", "pyannote/segmentation-3.0"]
-
-
-def check_gpu(device: str) -> None:
-    if device != "cuda":
-        return
-    import torch
-    if not torch.cuda.is_available():
-        die("CUDA not available – use --device cpu (slow) or fix the GPU setup")
-    free, total = torch.cuda.mem_get_info()
-    log(f"gpu: {torch.cuda.get_device_name(0)}, {free / 2**30:.1f} GiB free of {total / 2**30:.1f}")
 
 
 def check_hf() -> None:
@@ -194,39 +422,178 @@ def check_hf() -> None:
 
 # ----------------------------------------------------------------------------- transcribe
 
+SAMPLE_RATE = 16000
+
+# WhisperX's VAD defaults; the torch backend reuses them so both backends cut the
+# audio into the same speech chunks and produce comparable segments.
+VAD_CHUNK_S, VAD_ONSET, VAD_OFFSET = 30, 0.500, 0.363
+
+# faster-whisper model names -> the equivalent transformers repo, for the ones
+# where it is not just openai/whisper-<name>.
+HF_WHISPER_REPOS = {
+    "large": "openai/whisper-large-v3",
+    "turbo": "openai/whisper-large-v3-turbo",
+    "distil-large-v2": "distil-whisper/distil-large-v2",
+    "distil-large-v3": "distil-whisper/distil-large-v3",
+    "distil-medium.en": "distil-whisper/distil-medium.en",
+    "distil-small.en": "distil-whisper/distil-small.en",
+}
+
+
+def hf_whisper_repo(model_name: str) -> str:
+    if "/" in model_name:  # already a HuggingFace repo id
+        return model_name
+    return HF_WHISPER_REPOS.get(model_name, f"openai/whisper-{model_name}")
+
+
+def vad_chunks(audio, device: str) -> list[dict]:
+    """Speech regions merged into <=30 s chunks – the same segmentation WhisperX feeds
+    to CTranslate2, using WhisperX's own pyannote VAD (pure torch, so it runs anywhere).
+    The VAD weights ship inside the whisperx wheel, no HuggingFace token needed."""
+    import torch
+    from whisperx.vads import Pyannote
+    vad = Pyannote(torch.device(device), token=None,
+                   vad_onset=VAD_ONSET, vad_offset=VAD_OFFSET, chunk_size=VAD_CHUNK_S)
+    raw = vad({"waveform": Pyannote.preprocess_audio(audio), "sample_rate": SAMPLE_RATE})
+    return Pyannote.merge_chunks(raw, VAD_CHUNK_S, onset=VAD_ONSET, offset=VAD_OFFSET)
+
+
+def detect_language_torch(model, processor, feats) -> str:
+    import torch
+    try:
+        with torch.no_grad():
+            ids = model.detect_language(feats)
+        text = processor.tokenizer.decode(ids[0], skip_special_tokens=False)
+    except Exception:
+        with torch.no_grad():
+            out = model.generate(feats, max_new_tokens=1)
+        text = processor.tokenizer.decode(out[0], skip_special_tokens=False)
+    m = re.search(r"<\|([a-z]{2,3})\|>", text)
+    if not m:
+        die("could not detect the language – pass -l/--language (e.g. -l cs)")
+    return m.group(1)
+
+
+def transcribe_torch(audio, model_name: str, language: str | None, device: str, compute: str,
+                     batch_size: int, beam_size: int) -> dict:
+    """Whisper via transformers instead of CTranslate2, so it runs on ROCm/Metal/XPU.
+
+    Returns the same {"segments": [{text, start, end}], "language": ...} shape as
+    WhisperX's own pipeline, so alignment and diarization are unchanged downstream.
+    """
+    import torch
+    from transformers import AutoProcessor, WhisperForConditionalGeneration
+
+    repo = hf_whisper_repo(model_name)
+    dtype = getattr(torch, compute, None)
+    if not isinstance(dtype, torch.dtype):
+        die(f"--compute-type {compute} is not a torch dtype; use float16, bfloat16 or float32")
+    log(f"transcribe: loading {repo} ({compute}) on {device} via transformers")
+    processor = AutoProcessor.from_pretrained(repo)
+    try:
+        model = WhisperForConditionalGeneration.from_pretrained(repo, dtype=dtype)
+    except TypeError:  # transformers < 4.56 spells it torch_dtype
+        model = WhisperForConditionalGeneration.from_pretrained(repo, torch_dtype=dtype)
+    model = model.to(device).eval()
+
+    english_only = repo.endswith(".en")
+    if english_only:
+        language = "en"
+
+    log("transcribe: voice activity detection")
+    chunks = vad_chunks(audio, device)
+    if not chunks:
+        die("transcribe: no speech found in the audio")
+
+    def features(batch):
+        f = processor([audio[int(c["start"] * SAMPLE_RATE):int(c["end"] * SAMPLE_RATE)] for c in batch],
+                      sampling_rate=SAMPLE_RATE, return_tensors="pt",
+                      return_attention_mask=True, padding="max_length", truncation=True)
+        mask = getattr(f, "attention_mask", None)
+        return f.input_features.to(device, dtype), (mask.to(device) if mask is not None else None)
+
+    if language is None:
+        language = detect_language_torch(model, processor, features(chunks[:1])[0])
+        log(f"transcribe: detected language {language}")
+
+    log(f"transcribe: {len(chunks)} speech chunks, batch_size={batch_size}, beam_size={beam_size}")
+    segments: list[dict] = []
+    i = 0
+    while i < len(chunks):
+        batch = chunks[i:i + batch_size]
+        try:
+            feats, mask = features(batch)
+            kw = {"num_beams": beam_size}
+            if not english_only:
+                kw.update(language=language, task="transcribe")
+            if mask is not None:
+                kw["attention_mask"] = mask
+            with torch.no_grad():
+                ids = model.generate(feats, **kw)
+        except Exception as e:
+            if is_oom(e) and batch_size > 1:
+                batch_size //= 2
+                log(f"transcribe: GPU out of memory, retrying with batch_size={batch_size}")
+                empty_cache(device)
+                continue
+            raise
+        for c, text in zip(batch, processor.batch_decode(ids, skip_special_tokens=True)):
+            segments.append({"text": text.strip(), "start": round(c["start"], 3),
+                             "end": round(c["end"], 3)})
+        i += len(batch)
+        print(f"Progress: {100 * i / len(chunks):.2f}%...", flush=True)
+
+    del model
+    empty_cache(device)
+    return {"segments": segments, "language": language}
+
+
+def transcribe_faster_whisper(audio, model_name: str, language: str | None, device: str, compute: str,
+                              batch_size: int, beam_size: int) -> dict:
+    import whisperx
+    log(f"transcribe: loading {model_name} ({compute}) on {device} via faster-whisper")
+    model = whisperx.load_model(model_name, device, compute_type=compute, language=language,
+                                asr_options={"beam_size": beam_size, "best_of": beam_size})
+    log(f"transcribe: batch_size={batch_size}, beam_size={beam_size}")
+    while True:
+        try:
+            return model.transcribe(audio, batch_size=batch_size, language=language, print_progress=True)
+        except Exception as e:
+            if is_oom(e) and batch_size > 1:
+                batch_size //= 2
+                log(f"transcribe: GPU out of memory, retrying with batch_size={batch_size}")
+                empty_cache(device)
+                continue
+            raise
+
+
 def stage_transcribe(w: Work, model_name: str, language: str | None, device: str, batch_size: int,
-                     force: bool = False) -> dict:
+                     force: bool = False, backend: str = "auto", compute_type: str = "auto",
+                     beam_size: int = 5) -> dict:
     if w.transcript.exists() and not force:
         log(f"transcribe: {w.transcript.name} exists, skipping (use --force to redo)")
         return json.load(open(w.transcript))
     if not w.wav.exists():
         die("transcribe: audio.wav missing – run `audio` first")
-    check_gpu(device)
-    import torch
+    device, vendor, name = resolve_device(device)
+    backend = resolve_backend(backend, vendor)
+    compute = resolve_compute_type(compute_type, backend, device)
+    log_device(device, vendor, name, backend, compute)
+    check_norm_kernels(device)
+
     import whisperx
-    compute = "float16" if device == "cuda" else "int8"
-    log(f"transcribe: loading {model_name} ({compute}) on {device}")
-    model = whisperx.load_model(model_name, device, compute_type=compute, language=language)
     audio = whisperx.load_audio(str(w.wav))
-    log(f"transcribe: {len(audio) / 16000 / 60:.0f} min of audio, batch_size={batch_size}")
-    while True:
-        try:
-            result = model.transcribe(audio, batch_size=batch_size, language=language, print_progress=True)
-            break
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower() and batch_size > 1:
-                batch_size //= 2
-                log(f"transcribe: GPU out of memory, retrying with batch_size={batch_size}")
-                torch.cuda.empty_cache()
-                continue
-            raise
+    log(f"transcribe: {len(audio) / SAMPLE_RATE / 60:.0f} min of audio")
+    run = transcribe_torch if backend == "torch" else transcribe_faster_whisper
+    result = run(audio, model_name, language, device, compute, batch_size, beam_size)
+
     lang = result.get("language", language)
     log(f"transcribe: aligning words (language={lang})")
     align_model, meta = whisperx.load_align_model(language_code=lang, device=device)
     result = whisperx.align(result["segments"], align_model, meta, audio, device, return_char_alignments=False)
     result["language"] = lang
     json.dump(result, open(w.transcript, "w"), ensure_ascii=False)
-    w.update_meta(model=model_name, language=lang)
+    w.update_meta(model=model_name, language=lang, backend=backend, device=f"{vendor}:{device}")
     if w.diarized.exists():
         w.diarized.unlink()
         log("transcribe: removed stale diarized.json")
@@ -245,11 +612,14 @@ def stage_diarize(w: Work, device: str, force: bool = False) -> dict:
         die("diarize: transcript.json missing – run `transcribe` first")
     if not w.wav.exists():
         die("diarize: audio.wav missing – run `audio` first")
-    check_gpu(device)
+    device, vendor, name = resolve_device(device)
+    check_norm_kernels(device)
     check_hf()
     import whisperx
     from whisperx.diarize import DiarizationPipeline, assign_word_speakers
-    log("diarize: running pyannote (a few minutes)")
+    # pyannote is plain PyTorch, so this stage needs no backend switch – it already
+    # runs wherever torch runs, AMD included.
+    log(f"diarize: running pyannote on {name} (a few minutes)")
     audio = whisperx.load_audio(str(w.wav))
     result = json.load(open(w.transcript))
     segs = DiarizationPipeline(device=device)(audio)
@@ -476,7 +846,8 @@ def cmd_run(w: Work, inp: str, a) -> None:
         stage_audio(w, p)
     if not a.no_diarize:
         check_hf()  # fail early, before the long transcription
-    stage_transcribe(w, a.model, a.language, a.device, a.batch_size)
+    stage_transcribe(w, a.model, a.language, a.device, a.batch_size,
+                     backend=a.backend, compute_type=a.compute_type, beam_size=a.beam_size)
     if not a.no_diarize:
         stage_diarize(w, a.device)
         if w.speakers.exists():
@@ -508,17 +879,29 @@ def main(argv=None) -> None:
         p.add_argument("-w", "--workdir", required=required, help="work dir (default: ./work/<input stem>)")
 
     def add_gpu(p):
-        p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+        p.add_argument("--device", default="auto", choices=DEVICE_CHOICES,
+                       help="auto-detects NVIDIA/AMD/Apple/Intel GPUs; rocm forces an AMD card")
+
+    def add_asr(p):
+        p.add_argument("-m", "--model", default="large-v3")
+        p.add_argument("-l", "--language", default=None, help="e.g. cs, en; default auto-detect")
+        p.add_argument("-b", "--batch-size", type=int, default=4)
+        p.add_argument("--backend", default="auto", choices=BACKEND_CHOICES,
+                       help="faster-whisper needs CUDA or CPU; torch runs on any GPU torch supports "
+                            "(default: torch on non-NVIDIA GPUs)")
+        p.add_argument("--compute-type", default="auto", choices=COMPUTE_CHOICES,
+                       help="float16 on GPU by default; try float32 if an AMD card gives empty output")
+        p.add_argument("--beam-size", type=int, default=5)
 
     p = sub.add_parser("run", help="all stages in one go (interactive speaker naming)")
-    p.add_argument("input"); add_work(p); add_gpu(p)
-    p.add_argument("-m", "--model", default="large-v3")
-    p.add_argument("-l", "--language", default=None)
-    p.add_argument("-b", "--batch-size", type=int, default=4)
+    p.add_argument("input"); add_work(p); add_gpu(p); add_asr(p)
     p.add_argument("--no-diarize", action="store_true")
     p.add_argument("--default-label", default="speaker")
     p.add_argument("--top", type=int, default=6)
     p.add_argument("-y", "--yes", action="store_true", help="never prompt")
+
+    p = sub.add_parser("devices", help="which GPU and ASR backend this machine will use")
+    p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("status", help="what exists in the work dir and what to do next")
     add_work(p, True); p.add_argument("--json", action="store_true")
@@ -530,10 +913,7 @@ def main(argv=None) -> None:
     p.add_argument("media", nargs="?"); add_work(p)
 
     p = sub.add_parser("transcribe", help="WhisperX transcription + alignment")
-    add_work(p, True); add_gpu(p)
-    p.add_argument("-m", "--model", default="large-v3")
-    p.add_argument("-l", "--language", default=None, help="e.g. cs, en; default auto-detect")
-    p.add_argument("-b", "--batch-size", type=int, default=4)
+    add_work(p, True); add_gpu(p); add_asr(p)
     p.add_argument("--force", action="store_true")
 
     p = sub.add_parser("diarize", help="pyannote speaker labels")
@@ -560,6 +940,8 @@ def main(argv=None) -> None:
 
     if a.cmd == "run":
         cmd_run(Work(Path(a.workdir) if a.workdir else default_workdir(a.input)), a.input, a)
+    elif a.cmd == "devices":
+        cmd_devices(a.json)
     elif a.cmd == "status":
         cmd_status(Work(Path(a.workdir)), a.json)
     elif a.cmd == "download":
@@ -569,7 +951,8 @@ def main(argv=None) -> None:
         w = Work(Path(a.workdir) if a.workdir else default_workdir(a.media))
         stage_audio(w, Path(a.media) if a.media else None); log(f"next: transcribe -w {w.dir}")
     elif a.cmd == "transcribe":
-        stage_transcribe(Work(Path(a.workdir)), a.model, a.language, a.device, a.batch_size, a.force)
+        stage_transcribe(Work(Path(a.workdir)), a.model, a.language, a.device, a.batch_size, a.force,
+                         backend=a.backend, compute_type=a.compute_type, beam_size=a.beam_size)
         log("next: diarize (speaker labels) or write (plain transcript)")
     elif a.cmd == "diarize":
         stage_diarize(Work(Path(a.workdir)), a.device, a.force)
