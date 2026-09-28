@@ -631,7 +631,7 @@ async function renderSpeakers(body) {
         h("span", {}, p.text)))),
       h("div", { class: "first-q" }, names.map((n) => h("button", { class: "btn" + (single === n ? " primary" : ""), onclick: () => { single = n; save(); } }, n))),
       !doc.diarized ? h("p", { class: "small muted", style: { marginTop: "14px" } }, "Two people in it after all? ",
-        h("button", { class: "btn sm", onclick: () => startJob({}) }, "Find speakers")) : null,
+        h("button", { class: "btn sm", onclick: () => startJob({}) }, "Find speakers")) : "",
       namesEditor(1));
     return;
   }
@@ -652,7 +652,7 @@ async function renderSpeakers(body) {
   const voices = h("div", { class: "voices" });
   pane.append(voices);
   const saveRow = h("div", { class: "row", style: { marginTop: "18px" } });
-  pane.append(saveRow, names.length ? namesEditor(need) : null);
+  pane.append(saveRow, names.length ? namesEditor(need) : "");  // native append() would print null
 
   function drawVoices() {
     // colours follow the voices (first heard = first colour), the same as in the review

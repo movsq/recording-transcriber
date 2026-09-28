@@ -257,6 +257,19 @@ def _msg_index(spans, t_mid: float) -> int:
     return best
 
 
+def _word_msg(spans, w) -> int:
+    """Message a word belongs to. WhisperX often stretches a message's last word over the
+    silence after it, or starts the next message's first word early: when the middle of
+    the word falls into a silence, the end that lies inside a message decides."""
+    mid = (w["s"] + w["e"]) / 2
+    if any(s <= mid <= e for s, e in spans):
+        return _msg_index(spans, mid)
+    for t in (w["s"] + 0.05, w["e"] - 0.05):
+        if any(s <= t <= e for s, e in spans):
+            return _msg_index(spans, t)
+    return _msg_index(spans, mid)
+
+
 def build_doc(workdir: Path) -> dict:
     src = workdir / "diarized.json"
     if not src.exists():
@@ -278,7 +291,7 @@ def build_doc(workdir: Path) -> dict:
         groups: list[list[dict]] = []
         cur_m = None
         for w in ws:
-            m = _msg_index(spans, (w["s"] + w["e"]) / 2)
+            m = _word_msg(spans, w)
             if m != cur_m:
                 groups.append([]); cur_m = m
             w["m"] = m

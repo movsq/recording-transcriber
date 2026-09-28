@@ -282,6 +282,15 @@ next to the files above: `analysis.json` (silences, waveform, scene changes),
 moves the old files to `previous/<time>/` instead of deleting them. `work/` is
 git-ignored; the server warns if it ever is not.
 
+To try it, or to check a change to it, without a recording of your own,
+`uv run tests/webui_fixture.py` builds a 7-minute screen recording of voice
+messages from two public-domain LibriVox readings (Czech, three audio tracks,
+with a paused recording, a replayed message and long silences whose right
+answers are known), transcribes it and checks what the review screen finds.
+The video lands in `work/webui-fixture/videos/`; point `--videos` at that
+folder to click through it (the folder is remembered, so pass your own again
+afterwards).
+
 ---
 
 ## Models and speed
