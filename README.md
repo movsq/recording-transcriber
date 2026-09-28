@@ -250,6 +250,38 @@ is missing (no token, no access to a gated model, wrong speaker id, missing
 stage), so nothing needs a terminal or stdin except `speakers ask` and
 `run` without `-y`.
 
+### Web UI
+
+```bash
+uv run webui/server.py              # or: python3 webui/server.py (standard library only)
+```
+
+opens <http://127.0.0.1:8765> and takes a recording from your Videos folder
+(`--videos DIR` to use another one) to a corrected `transcript_clean.txt`
+without a terminal: pick the audio track (each one with its loudness and a
+listen button), transcribe and diarize, name the speakers by who talks first,
+correct the text while listening — click any word to play from it — and
+export. It listens on 127.0.0.1 only, drives `transcribe.py` through the stages
+above, runs one GPU job at a time, and checks free VRAM before each GPU stage
+(NVIDIA via `nvidia-smi`, AMD via the kernel's per-process accounting), naming
+whatever holds it. It never stops anything itself.
+
+While you review, it points out places where a screen recording was probably
+paused (a jump in the video, a stretch of words said twice, speech resuming
+mid-sentence after a silence) with a one-click fix, and keeps a stretch between
+two digital silences — typically one played-back message — to a single speaker.
+None of that is needed for ordinary recordings; without video or digital
+silence those checks simply find nothing. If an OpenAI-compatible server such
+as `llama-server` is running on port 8080 (or the URL in `llm_url`), it can
+suggest corrections, applied only when you accept them.
+
+Your choices (default track, language, speaker names, `llm_url`) are kept in
+`work/.webui-settings.json`. Everything else it writes stays in the work dir
+next to the files above: `analysis.json` (silences, waveform, scene changes),
+`review.json` (your corrections) and `transcript_clean.txt`. Redoing a stage
+moves the old files to `previous/<time>/` instead of deleting them. `work/` is
+git-ignored; the server warns if it ever is not.
+
 ---
 
 ## Models and speed

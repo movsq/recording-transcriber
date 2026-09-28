@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Přepis</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='7' width='26' height='18' rx='9' fill='%233056D3'/%3E%3Cg fill='%23fff'%3E%3Crect x='9' y='13' width='2' height='6' rx='1'/%3E%3Crect x='13' y='10' width='2' height='12' rx='1'/%3E%3Crect x='17' y='12' width='2' height='8' rx='1'/%3E%3Crect x='21' y='14' width='2' height='4' rx='1'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/" aria-label="All recordings">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="7" width="26" height="18" rx="9"/><g><rect x="9" y="13" width="2" height="6" rx="1"/><rect x="13" y="10" width="2" height="12" rx="1"/><rect x="17" y="12" width="2" height="8" rx="1"/><rect x="21" y="14" width="2" height="4" rx="1"/></g></svg>
+    <span>Přepis</span>
+  </a>
+  <button class="lib-toggle" id="libToggle" aria-controls="library" aria-expanded="false">Recordings</button>
+  <div class="top-spacer"></div>
+  <div id="jobChip"></div>
+  <button class="gpu-chip" id="gpuChip" aria-haspopup="dialog">GPU …</button>
+</header>
+<div class="shell">
+  <nav class="library" id="library" aria-label="Recordings"></nav>
+  <main id="main" tabindex="-1"></main>
+</div>
+<div id="gpuPop" class="popover" role="dialog" aria-label="GPU memory" hidden></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<div id="lightbox" class="lightbox" hidden></div>
+<audio id="audio" preload="auto"></audio>
+<audio id="preview" preload="none"></audio>
+<script src="/app.js"></script>
+</body>
+</html>
