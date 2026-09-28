@@ -410,6 +410,51 @@ and Lightning offering to upgrade the bundled VAD checkpoint.
 
 ---
 
+## Regression suite
+
+`tests/regression.py` puts a 9-minute English recording with a known transcript
+(the 73 clips of LibriSpeech's `librispeech_asr_dummy`) through the
+transcription configs below and fails if anything moved:
+
+```bash
+uv run tests/regression.py                                          # everything, vs main
+uv run tests/regression.py --only fw-tiny-cpu torch-tiny-cpu cli    # ~2 min, no GPU needed
+uv run tests/regression.py --baseline v1                            # compare against another ref
+```
+
+On AMD, `pip install pyarrow` into the venv and run `python tests/regression.py`.
+
+| config | what it pins down |
+|---|---|
+| `fw-large` | faster-whisper `large-v3` on NVIDIA, byte-identical to the same run at `--baseline` |
+| `torch-large` | the torch backend with the real default model on the GPU |
+| `torch-large-oom` | `-b 512` runs out of memory, halves down to 4 and matches `torch-large` byte for byte |
+| `fw-tiny-cpu` | faster-whisper on CPU, byte-identical to `--baseline` |
+| `torch-tiny-cpu` | torch backend on CPU, language auto-detected |
+| `cli` | `devices --json` stays pure JSON without a GPU; a missing `--device` or `--compute-type int8 --backend torch` exits with a one-line `ERROR:`; labels with diacritics go through `speakers set` and `write` |
+
+Every run is also checked for WER under a ceiling (5 % for `large-v3`, 13 % for
+`tiny`), language `en`, a timestamp on every word and segments in order.
+Configs this machine cannot run are skipped and listed. Logs and outputs stay
+in `work/regression/`.
+
+Run it for any change that touches transcription. The faster-whisper rows must
+stay byte-identical: that is the path every NVIDIA user is on, and work on the
+torch backend has no business moving it. The run ends with a table to paste
+into the PR; on an RTX 3060 (torch 2.8 cu128, whisperx 3.8.6), with `--baseline HEAD~1`:
+
+| config | transcribe.py | segments | words | WER | time | |
+|---|---|---|---|---|---|---|
+| fw-large | checkout | 83 | 1140 | 3.83 % | 26 s | identical to HEAD~1 |
+| fw-large | HEAD~1 | 83 | 1140 | 3.83 % | 23 s |  |
+| torch-large | checkout | 83 | 1140 | 3.91 % | 66 s |  |
+| torch-large-oom | checkout | 83 | 1140 | 3.91 % | 68 s | OOM -> b=4, identical to torch-large |
+| fw-tiny-cpu | checkout | 82 | 1150 | 10.78 % | 26 s | identical to HEAD~1 |
+| fw-tiny-cpu | HEAD~1 | 82 | 1150 | 10.78 % | 26 s |  |
+| torch-tiny-cpu | checkout | 85 | 1151 | 10.17 % | 39 s |  |
+
+---
+
 ## Česky
 
 Skript stáhne záznam (SharePoint odkaz nebo soubor), přepíše ho přes WhisperX,
